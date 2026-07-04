@@ -744,6 +744,7 @@ pub enum ScreenInstruction {
         rounded_corners: bool,
         hide_session_name: bool,
         stacked_resize: bool,
+        stacked_pane_list: bool,
         default_editor: Option<PathBuf>,
         advanced_mouse_actions: bool,
         mouse_hover_effects: bool,
@@ -1411,6 +1412,7 @@ pub(crate) struct Screen {
     pixel_dimensions: PixelDimensions,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     stacked_resize: Rc<RefCell<bool>>,
+    stacked_pane_list: Rc<RefCell<bool>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
     terminal_emulator_colors: Rc<RefCell<Palette>>,
     terminal_emulator_color_codes: Rc<RefCell<HashMap<usize, String>>>,
@@ -1549,6 +1551,7 @@ impl Screen {
         layout_dir: Option<PathBuf>,
         explicitly_disable_kitty_keyboard_protocol: bool,
         stacked_resize: bool,
+        stacked_pane_list: bool,
         default_editor: Option<PathBuf>,
         web_clients_allowed: bool,
         web_sharing: WebSharing,
@@ -1573,6 +1576,7 @@ impl Screen {
             pixel_dimensions: Default::default(),
             character_cell_size: Rc::new(RefCell::new(None)),
             stacked_resize: Rc::new(RefCell::new(stacked_resize)),
+            stacked_pane_list: Rc::new(RefCell::new(stacked_pane_list)),
             sixel_image_store: Rc::new(RefCell::new(SixelImageStore::default())),
             style: client_attributes.style,
             connected_clients: Rc::new(RefCell::new(HashMap::new())),
@@ -2022,6 +2026,9 @@ impl Screen {
                     .with_context(err_context)?;
             }
             destination_tab.set_force_render();
+            if destination_tab.has_stack_lists() {
+                destination_tab.set_should_clear_display_before_rendering();
+            }
             destination_tab.visible(true).with_context(err_context)?;
         }
         Ok(())
@@ -3305,6 +3312,7 @@ impl Screen {
             self.size,
             self.character_cell_size.clone(),
             self.stacked_resize.clone(),
+            self.stacked_pane_list.clone(),
             self.sixel_image_store.clone(),
             self.bus
                 .os_input
@@ -4604,12 +4612,13 @@ impl Screen {
     ) -> Result<()> {
         let err_context = || "failed break pane out of tab".to_string();
         let active_tab = self.get_active_tab_mut(client_id)?;
+        let active_pane_id = active_tab
+            .get_active_pane_id(client_id)
+            .with_context(err_context)?;
         if active_tab.get_selectable_tiled_panes_count() > 1
             || active_tab.get_visible_selectable_floating_panes_count() > 0
+            || active_tab.pane_is_stack_list_member(&active_pane_id)
         {
-            let active_pane_id = active_tab
-                .get_active_pane_id(client_id)
-                .with_context(err_context)?;
             let active_pane = active_tab
                 .extract_pane(active_pane_id, false)
                 .with_context(err_context)?;
@@ -4650,9 +4659,6 @@ impl Screen {
                 None,
             ))?;
         } else {
-            let active_pane_id = active_tab
-                .get_active_pane_id(client_id)
-                .with_context(err_context)?;
             self.bus
                 .senders
                 .send_to_background_jobs(BackgroundJob::DisplayPaneError(
@@ -5027,6 +5033,7 @@ impl Screen {
         rounded_corners: bool,
         hide_session_name: bool,
         stacked_resize: bool,
+        stacked_pane_list: bool,
         default_editor: Option<PathBuf>,
         advanced_mouse_actions: bool,
         mouse_hover_effects: bool,
@@ -5065,6 +5072,9 @@ impl Screen {
         {
             *self.stacked_resize.borrow_mut() = stacked_resize;
         }
+        {
+            *self.stacked_pane_list.borrow_mut() = stacked_pane_list;
+        }
         if let Some(copy_to_clipboard) = copy_to_clipboard {
             self.copy_options.clipboard = copy_to_clipboard;
         }
@@ -5081,6 +5091,7 @@ impl Screen {
             tab.update_mouse_hover_effects(mouse_hover_effects);
             tab.update_focus_follows_mouse(focus_follows_mouse);
             tab.update_mouse_click_through(mouse_click_through);
+            tab.sync_stacked_pane_list_mode();
         }
 
         // Clear hover state when disabled
@@ -5527,6 +5538,7 @@ impl Screen {
                 );
             }
 
+            let stack_list_geoms = tab.stack_list_serialization_geoms();
             let tiled_panes: Vec<PaneLayoutMetadata> = tab
                 .get_tiled_panes()
                 .map(|(pane_id, p)| {
@@ -5535,14 +5547,21 @@ impl Screen {
                     // is currently only the case the scrollback editing panes, and
                     // when dumping the layout we want the "real" pane and not the
                     // editor pane
-                    match suppressed_panes.remove(pane_id) {
+                    let geom_override = stack_list_geoms.get(pane_id).copied();
+                    let (pane_id, p) = match suppressed_panes.remove(pane_id) {
                         Some((is_scrollback_editor, suppressed_pane)) if *is_scrollback_editor => {
                             (suppressed_pane.pid(), suppressed_pane)
                         },
                         _ => (*pane_id, p),
-                    }
+                    };
+                    (
+                        pane_id,
+                        p,
+                        geom_override.unwrap_or_else(|| p.position_and_size()),
+                    )
                 })
-                .map(|(pane_id, p)| {
+                .chain(tab.hidden_stack_list_members_for_serialization())
+                .map(|(pane_id, p, geom)| {
                     let focused_clients: Vec<ClientId> = active_pane_ids
                         .iter()
                         .filter_map(|(c_id, p_id)| {
@@ -5552,7 +5571,7 @@ impl Screen {
                     let (default_fg, default_bg) = p.get_pane_default_colors();
                     PaneLayoutMetadata::new(
                         pane_id,
-                        p.position_and_size(),
+                        geom,
                         p.borderless(),
                         p.invoked_with().clone(),
                         p.custom_title(),
@@ -6076,6 +6095,11 @@ fn find_already_running_panes(
     let running_tiled_instructions: Vec<Option<Run>> = active_tab
         .get_tiled_panes()
         .map(|(_, pane)| pane.invoked_with().clone())
+        .chain(
+            active_tab
+                .suppressed_stack_list_members()
+                .map(|(_, pane)| pane.invoked_with().clone()),
+        )
         .collect();
 
     let mut tiled_to_ignore = Vec::new();
@@ -6191,6 +6215,7 @@ pub(crate) fn screen_thread_main(
         .unwrap_or(false); // by default, we try to support this if the terminal supports it and
                            // the program running inside a pane requests it
     let stacked_resize = config_options.stacked_resize.unwrap_or(true);
+    let stacked_pane_list = config_options.stacked_pane_list.unwrap_or(true);
     let web_clients_allowed = config_options
         .web_sharing
         .map(|s| s.web_clients_allowed())
@@ -6234,6 +6259,7 @@ pub(crate) fn screen_thread_main(
         layout_dir,
         explicitly_disable_kitty_keyboard_protocol,
         stacked_resize,
+        stacked_pane_list,
         default_editor,
         web_clients_allowed,
         web_sharing,
@@ -9379,6 +9405,7 @@ pub(crate) fn screen_thread_main(
                 rounded_corners,
                 hide_session_name,
                 stacked_resize,
+                stacked_pane_list,
                 default_editor,
                 advanced_mouse_actions,
                 mouse_hover_effects,
@@ -9403,6 +9430,7 @@ pub(crate) fn screen_thread_main(
                         rounded_corners,
                         hide_session_name,
                         stacked_resize,
+                        stacked_pane_list,
                         default_editor,
                         advanced_mouse_actions,
                         mouse_hover_effects,
