@@ -71,6 +71,7 @@ pub struct StackListEntry {
     pub label: String,
     pub is_selected: bool,
     pub is_emphasized: bool,
+    pub stack_is_focused: bool,
 }
 
 pub struct FrameParams {
@@ -743,10 +744,9 @@ impl PaneFrame {
     }
     fn render_stack_list_entry(&self, entry: &StackListEntry) -> Vec<TerminalCharacter> {
         let usable_cols = self.geom.cols.saturating_sub(2);
-        let bracket_overhead = "[  ]".width();
-        let inner_width = entry
-            .width
-            .min(usable_cols.saturating_sub(bracket_overhead));
+        let selection_marker = "> ";
+        let marker_width = selection_marker.width();
+        let inner_width = entry.width.min(usable_cols.saturating_sub(marker_width));
         let content = if entry.label.width() <= inner_width {
             entry.label.clone()
         } else {
@@ -761,19 +761,9 @@ impl PaneFrame {
             truncated.push('…');
             truncated
         };
-        let padding = " ".repeat(inner_width.saturating_sub(content.width()));
-        let padded_content = format!("{}{}", content, padding);
-        let left_bracket = "[ ";
-        let right_bracket = " ]";
-        let entry_length = left_bracket.width() + padded_content.width() + right_bracket.width();
-        let entry_start = usable_cols.saturating_sub(entry_length) / 2;
-        let selection_sign = "<↓↑> ";
-        let selection_sign_width = if entry.is_selected && entry_start >= selection_sign.width() {
-            selection_sign.width()
-        } else {
-            0
-        };
-        let left_budget = entry_start.saturating_sub(selection_sign_width);
+        let full_width_entry_length = marker_width + inner_width;
+        let entry_start = usable_cols.saturating_sub(full_width_entry_length) / 2;
+        let left_budget = entry_start;
         let (mut focus_part, focus_length) = self
             .bracketed_focus_indicator(left_budget)
             .unwrap_or((vec![], 0));
@@ -782,27 +772,27 @@ impl PaneFrame {
         for _ in focus_length..left_budget {
             line.push(EMPTY_TERMINAL_CHARACTER);
         }
-        if selection_sign_width > 0 {
-            line.append(&mut foreground_color(selection_sign, self.color));
-        }
-        let content_color = if entry.is_emphasized {
-            self.color
-        } else {
-            self.color_override
-        };
+        let unfocused_color = self.style.colors.frame_unselected.map(|frame| frame.base);
         if entry.is_selected {
-            line.append(&mut foreground_color(left_bracket, self.color_override));
-            line.append(&mut foreground_color(&padded_content, self.color));
-            line.append(&mut foreground_color(right_bracket, self.color_override));
+            line.append(&mut foreground_color(selection_marker, None));
         } else {
-            let unbracketed = format!("  {}  ", padded_content);
-            if entry.is_emphasized {
-                line.append(&mut foreground_color(&unbracketed, content_color));
-            } else {
-                line.append(&mut dimmed_foreground_color(&unbracketed, content_color));
+            for _ in 0..marker_width {
+                line.push(EMPTY_TERMINAL_CHARACTER);
             }
         }
-        let mut occupied_columns = entry_start + entry_length;
+        let mut styled_content = if entry.is_selected || entry.is_emphasized {
+            foreground_color(&content, self.color)
+        } else if entry.stack_is_focused {
+            foreground_color(&content, unfocused_color)
+        } else {
+            dimmed_foreground_color(&content, unfocused_color)
+        };
+        line.append(&mut styled_content);
+        let entry_padding = full_width_entry_length.saturating_sub(marker_width + content.width());
+        for _ in 0..entry_padding {
+            line.push(EMPTY_TERMINAL_CHARACTER);
+        }
+        let mut occupied_columns = entry_start + full_width_entry_length;
         let (mut scroll_part, scroll_length) = self
             .bracketed_scroll_indicator(usable_cols.saturating_sub(occupied_columns))
             .unwrap_or((vec![], 0));
